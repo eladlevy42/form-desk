@@ -8,6 +8,7 @@ export type FontMetrics = {
 
 let metrics: FontMetrics = { ascent: 0.8, descent: 0.2 }
 let fontBytes: Uint8Array | null = null
+let scriptBytes: Uint8Array | null = null
 let ready: Promise<void> | null = null
 
 export function fontMetrics(): FontMetrics {
@@ -18,20 +19,26 @@ export function getFontBytes(): Uint8Array | null {
   return fontBytes
 }
 
+export function getScriptBytes(): Uint8Array | null {
+  return scriptBytes
+}
+
 export function ensureFonts(): Promise<void> {
   if (!ready) ready = load()
   return ready
 }
 
 async function load(): Promise<void> {
-  const [notoFace, vibesFace, notoRes] = await Promise.all([
+  const [notoFace, vibesFace, notoRes, scriptRes] = await Promise.all([
     new FontFace('Noto Sans Hebrew', `url(${notoUrl})`).load(),
     new FontFace('Great Vibes', `url(${vibesUrl})`).load(),
     fetch(notoUrl),
+    fetch(vibesUrl),
   ])
   document.fonts.add(notoFace)
   document.fonts.add(vibesFace)
   fontBytes = new Uint8Array(await notoRes.arrayBuffer())
+  scriptBytes = new Uint8Array(await scriptRes.arrayBuffer())
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d')
   if (!ctx) return

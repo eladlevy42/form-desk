@@ -2,6 +2,7 @@ import type { DocState, SessionV1 } from './types.ts'
 
 const DB_NAME = 'form-desk'
 const STORE = 'session'
+const DOCS = 'docs'
 const KEY = 'current'
 
 let database: IDBDatabase | null = null
@@ -11,10 +12,11 @@ function openDb(): Promise<IDBDatabase> {
   if (database) return Promise.resolve(database)
   if (opening) return opening
   opening = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, 2)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE)
+      if (!db.objectStoreNames.contains(DOCS)) db.createObjectStore(DOCS)
     }
     req.onsuccess = () => {
       database = req.result
@@ -57,6 +59,8 @@ export function sessionFromDoc(doc: DocState, savedAt = Date.now()): SessionV1 {
     signatures: doc.signatures,
     covers: doc.covers,
     edits: doc.edits,
+    marks: doc.marks,
+    images: doc.images,
     values: doc.values,
     pageIndex: doc.pageIndex,
     zoom: doc.zoom,
@@ -104,4 +108,53 @@ export async function clearSession(): Promise<void> {
 
 export function bytesFromSession(session: SessionV1): Uint8Array {
   return new Uint8Array(session.pdf)
+}
+
+export type DocSummary = { id: string; savedAt: number; fileName: string }
+
+export async function saveNamedDoc(id: string, doc: DocState, savedAt = Date.now()): Promise<void> {
+  const db = await openDb()
+  const session = sessionFromDoc(doc, savedAt)
+  session.docId = id
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(DOCS, 'readwrite')
+    tx.objectStore(DOCS).put({ id, savedAt, fileName: doc.fileName, session }, id)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+  const all = await listDocs()
+  const extra = all.filter((item) => item.id !== id).slice(6)
+  if (!extra.length) return
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(DOCS, 'readwrite')
+    extra.forEach((item) => tx.objectStore(DOCS).delete(item.id))
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+export async function listDocs(): Promise<DocSummary[]> {
+  const db = await openDb()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DOCS, 'readonly')
+    const req = tx.objectStore(DOCS).getAll()
+    req.onsuccess = () => {
+      const rows = (req.result as Array<{ id: string; savedAt: number; fileName: string }> | undefined) ?? []
+      resolve(rows.map((row) => ({ id: row.id, savedAt: row.savedAt, fileName: row.fileName })).sort((a, b) => b.savedAt - a.savedAt))
+    }
+    req.onerror = () => reject(req.error)
+  })
+}
+
+export async function loadNamedDoc(id: string): Promise<SessionV1 | null> {
+  const db = await openDb()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DOCS, 'readonly')
+    const req = tx.objectStore(DOCS).get(id)
+    req.onsuccess = () => {
+      const row = req.result as { session?: SessionV1 } | undefined
+      resolve(row?.session ?? null)
+    }
+    req.onerror = () => reject(req.error)
+  })
 }

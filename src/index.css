@@ -211,6 +211,66 @@ button { cursor: pointer; }
 
 .edit-box { position: absolute; z-index: 4; }
 
+.box-frame { position: absolute; z-index: 4; touch-action: none; }
+
+.box-frame.selected { outline: 2px solid var(--teal); outline-offset: 1px; }
+
+.box-drag {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -16px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: var(--teal);
+  cursor: grab;
+  touch-action: none;
+}
+
+.box-text {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0 1px;
+  border: 0;
+  resize: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: transparent;
+  font-family: "Noto Sans Hebrew", sans-serif;
+}
+
+.box-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--paper);
+  border: 2px solid var(--teal);
+  border-radius: 2px;
+  touch-action: none;
+  z-index: 5;
+}
+
+.box-handle-nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.box-handle-n { left: calc(50% - 5px); top: -6px; cursor: ns-resize; }
+.box-handle-ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.box-handle-e { right: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+.box-handle-se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.box-handle-s { left: calc(50% - 5px); bottom: -6px; cursor: ns-resize; }
+.box-handle-sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.box-handle-w { left: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+
+.run-hit.picked { border-color: var(--stamp); background: rgba(141, 52, 41, 0.12); }
+
+.guide { position: absolute; z-index: 6; pointer-events: none; background: var(--stamp); }
+.guide-x { top: 0; bottom: 0; width: 1px; }
+.guide-y { left: 0; right: 0; height: 1px; }
+
 .edit-move {
   position: absolute;
   left: -14px;

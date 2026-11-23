@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
+import { BoxFrame } from './BoxFrame.tsx'
 import { SignatureDialog } from './SignatureDialog.tsx'
 import { hasHebrew, resolvedAlign } from './lib/bidi.ts'
 import { ensureFonts, fontMetrics, getFontBytes, measureTextWidth } from './lib/fonts.ts'
+import { layoutLines, type Guide, type Rect } from './lib/layout.ts'
 import { exportPdf, initialValues, openPdf, readPagesAndFields } from './lib/pdf.ts'
-import { editDiffers, extractRuns, runCoverBox } from './lib/runs.ts'
+import { combineRuns, editDiffers, extractRuns, partCover, runCoverBox, splitRun, splitRunText } from './lib/runs.ts'
 import { bytesFromSession, clearSession, loadSession, saveSession, saveSessionNow } from './lib/storage.ts'
 import {
   SAMPLE_NAME,
@@ -22,10 +24,10 @@ import {
 
 const CLICK_BIAS = 0.3
 
-type Tool = 'text' | 'whiteout' | 'edit'
+type Tool = 'text' | 'whiteout' | 'edit' | 'highlight' | 'line' | 'check' | 'cross' | 'date'
 type PendingFile = { bytes: Uint8Array; name: string }
 type SigDraft = { dataUrl: string; aspect: number }
-type Snap = Pick<DocState, 'texts' | 'signatures' | 'covers' | 'values' | 'edits'>
+type Snap = Pick<DocState, 'texts' | 'signatures' | 'covers' | 'values' | 'edits' | 'marks' | 'images' | 'runs'>
 
 export default function App() {
   const [boot, setBoot] = useState<'loading' | 'ready'>('loading')
@@ -39,6 +41,8 @@ export default function App() {
   const [tool, setTool] = useState<Tool>('text')
   const [focusId, setFocusId] = useState<string | null>(null)
   const [editFocus, setEditFocus] = useState<string | null>(null)
+  const [picked, setPicked] = useState<string[]>([])
+  const [guides, setGuides] = useState<Guide[]>([])
   const [selectedSig, setSelectedSig] = useState<string | null>(null)
   const [selectedCover, setSelectedCover] = useState<string | null>(null)
   const [pendingSig, setPendingSig] = useState<SigDraft | null>(null)
@@ -263,6 +267,8 @@ export default function App() {
       covers: restored?.covers ?? [],
       runs,
       edits: (restored?.edits ?? []).filter((edit) => runs.some((run) => run.id === edit.runId)),
+      marks: restored?.marks ?? [],
+      images: restored?.images ?? [],
       values: { ...initialValues(fields), ...(restored?.values ?? {}) },
       pageIndex: clamp(restored?.pageIndex ?? 0, 0, Math.max(0, pages.length - 1)),
       zoom: restored?.zoom ?? guessZoom(pages[0]?.width ?? 595, rowHeight),
@@ -283,6 +289,7 @@ export default function App() {
     setPendingSig(null)
     setTool('text')
     setStatus(null)
+    setPicked([])
     setRestored(fromSession)
     publish(next)
   }
@@ -334,6 +341,8 @@ export default function App() {
         covers: current.covers,
         runs: current.runs,
         edits: current.edits,
+        marks: current.marks,
+        images: current.images,
         values: current.values,
       })
       const copy = new Uint8Array(result.bytes)
@@ -390,6 +399,33 @@ export default function App() {
     }
   }
 
+  function boxesExcept(selfId: string): Rect[] {
+    const current = docRef.current
+    if (!current) return []
+    const rects: Rect[] = []
+    const metricsNow = fontMetrics()
+    for (const text of current.texts) {
+      if (text.id === selfId || text.page !== current.pageIndex) continue
+      const h = text.boxHeight ?? text.fontSize * (metricsNow.ascent + metricsNow.descent)
+      rects.push({ x: text.x, y: text.y - text.fontSize * metricsNow.ascent, w: text.boxWidth, h })
+    }
+    for (const edit of current.edits) {
+      if (edit.id === selfId || edit.deleted || edit.page !== current.pageIndex) continue
+      rects.push({
+        x: edit.x,
+        y: edit.baseline - edit.fontSize * metricsNow.ascent,
+        w: edit.boxWidth || 40,
+        h: edit.boxHeight || edit.fontSize,
+      })
+    }
+    for (const run of current.runs) {
+      if (run.page !== current.pageIndex || run.id === selfId) continue
+      const box = runCoverBox(run)
+      rects.push({ x: box.x, y: box.y, w: box.width, h: box.height })
+    }
+    return rects
+  }
+
   function snapPoint(x: number, y: number): { x: number; y: number } {
     const current = docRef.current
     if (!current) return { x, y }
@@ -418,6 +454,7 @@ export default function App() {
       color: current.color,
       align: current.align,
       boxWidth: current.cellWidth,
+      font: 'noto',
     }
     gesture.current = false
     remember()
@@ -450,6 +487,10 @@ export default function App() {
       color: run.color,
       bold: run.bold,
       deleted: false,
+      boxWidth: Math.max(run.width, 28),
+      boxHeight: (run.ascent + run.descent) * run.fontSize,
+      align: 'auto',
+      font: 'noto',
     }
     gesture.current = false
     remember()
@@ -500,6 +541,53 @@ export default function App() {
     }))
   }
 
+  function activeRunId(current: DocState): string | null {
+    const edit = current.edits.find((item) => item.id === editFocus)
+    if (edit) return edit.runId
+    return picked.length === 1 ? picked[0] : null
+  }
+
+  function mergePicked() {
+    const current = docRef.current
+    if (!current || picked.length < 2) return
+    const chosen = current.runs.filter((run) => picked.includes(run.id))
+    if (chosen.length < 2) return
+    const merged = combineRuns(chosen)
+    const ids = new Set(chosen.map((run) => run.id))
+    gesture.current = false
+    remember()
+    apply((d) => ({
+      ...d,
+      runs: [...d.runs.filter((run) => !ids.has(run.id)), merged],
+      edits: d.edits.filter((edit) => !ids.has(edit.runId)),
+    }))
+    setPicked([merged.id])
+    setStatus(null)
+  }
+
+  function splitFocused() {
+    const current = docRef.current
+    if (!current) return
+    const run = current.runs.find((item) => item.id === activeRunId(current))
+    if (!run) return
+    const edit = current.edits.find((item) => item.runId === run.id)
+    const text = edit?.text || run.text
+    let at = Math.floor(text.length / 2)
+    const field = document.querySelector<HTMLTextAreaElement>(`[data-edit-id="${edit?.id ?? ''}"]`)
+    if (field && field.selectionStart > 0 && field.selectionStart < text.length) at = field.selectionStart
+    const pieces = run.parts.length > 1 ? splitRun(run) : splitRunText({ ...run, text }, at)
+    if (pieces.length < 2) return
+    gesture.current = false
+    remember()
+    apply((d) => ({
+      ...d,
+      runs: [...d.runs.filter((item) => item.id !== run.id), ...pieces],
+      edits: d.edits.filter((edit) => edit.runId !== run.id),
+    }))
+    setEditFocus(null)
+    setPicked(pieces.map((item) => item.id))
+  }
+
   function dropUnchangedEdits(keepId: string | null) {
     const current = docRef.current
     if (!current) return
@@ -510,6 +598,22 @@ export default function App() {
     })
     if (!stale.length) return
     apply((d) => ({ ...d, edits: d.edits.filter((edit) => !stale.some((item) => item.id === edit.id)) }))
+  }
+
+  function updateTextBox(id: string, patch: Partial<TextItem>, live: boolean) {
+    if (live) {
+      if (!gesture.current) {
+        remember()
+        gesture.current = true
+      }
+    } else {
+      gesture.current = false
+    }
+    if (Object.keys(patch).length === 0) return
+    apply((d) => ({
+      ...d,
+      texts: d.texts.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    }))
   }
 
   function updateText(id: string, text: string, live: boolean) {
@@ -574,6 +678,10 @@ export default function App() {
         color: current.color,
         align: current.align,
         boxWidth: current.cellWidth,
+        boxHeight: item.boxHeight,
+        font: item.font,
+        underline: item.underline,
+        background: item.background,
       }
       remember()
       apply((d) => ({ ...d, texts: [...d.texts, created] }))
@@ -973,6 +1081,21 @@ export default function App() {
             >
               {activeEdit?.deleted ? 'Restore' : 'Delete text'}
             </button>
+            <button type="button" className="btn" data-testid="merge-runs" disabled={picked.length < 2} onClick={mergePicked}>
+              Merge
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="split-run"
+              disabled={!doc.runs.some((run) => {
+                const id = activeEdit ? activeEdit.runId : picked.length === 1 ? picked[0] : ''
+                return run.id === id && (run.parts.length > 1 || run.text.trim().length > 1)
+              })}
+              onClick={splitFocused}
+            >
+              Split
+            </button>
             <button
               type="button"
               className={tool === 'whiteout' ? 'btn on' : 'btn'}
@@ -1018,7 +1141,7 @@ export default function App() {
             {pendingSig
               ? 'Click the page where the signature should go. Esc cancels.'
               : tool === 'edit'
-                ? 'Click existing text to rewrite it. Drag the teal grip to move it. Delete text removes the original words.'
+                ? 'Click a time or line to rewrite all of it. Shift-click boxes, then Merge or Split. Drag the teal bar to move; handles resize.'
                 : 'Click where the words should start. Tab moves across, Enter moves down. Whiteout covers a printed line.'}
             {doc.fields.length ? ` ${doc.fields.length} fillable field${doc.fields.length === 1 ? '' : 's'} on this file.` : ''}
           </p>
@@ -1064,29 +1187,39 @@ export default function App() {
                   .map((edit) => {
                     const run = doc.runs.find((item) => item.id === edit.runId)
                     if (!run || (edit.id !== editFocus && !editDiffers(edit, run))) return null
-                    const box = runCoverBox(run)
-                    return (
-                      <button
-                        key={`${edit.id}-cover`}
-                        type="button"
-                        data-overlay
-                        data-testid="edit-cover"
-                        className={editFocus === edit.id ? 'edit-cover on' : 'edit-cover'}
-                        style={{
-                          left: box.x * scale,
-                          top: box.y * scale,
-                          width: box.width * scale,
-                          height: box.height * scale,
-                          background: run.background,
-                        }}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          setEditFocus(edit.id)
-                          setFocusId(null)
-                        }}
-                      />
-                    )
+                    const parts = run.parts.length ? run.parts : [{ x: run.x, baseline: run.baseline, width: run.width, text: run.text, fontSize: run.fontSize, ascent: run.ascent, descent: run.descent }]
+                    return parts.map((part, index) => {
+                      const box = partCover(part)
+                      return (
+                        <button
+                          key={`${edit.id}-cover-${index}`}
+                          type="button"
+                          data-overlay
+                          data-testid="edit-cover"
+                          className={editFocus === edit.id ? 'edit-cover on' : 'edit-cover'}
+                          style={{
+                            left: box.x * scale,
+                            top: box.y * scale,
+                            width: box.width * scale,
+                            height: box.height * scale,
+                            background: run.background,
+                          }}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            setEditFocus(edit.id)
+                            setFocusId(null)
+                          }}
+                        />
+                      )
+                    })
                   })}
+                {guides.map((guide, index) => (
+                  <div
+                    key={`${guide.axis}-${guide.at}-${index}`}
+                    className={guide.axis === 'x' ? 'guide guide-x' : 'guide guide-y'}
+                    style={guide.axis === 'x' ? { left: guide.at * scale } : { top: guide.at * scale }}
+                  />
+                ))}
                 {tool === 'edit'
                   ? doc.runs
                       .filter((run) => run.page === doc.pageIndex)
@@ -1103,7 +1236,8 @@ export default function App() {
                             data-overlay
                             data-testid="text-run"
                             data-text={run.text}
-                            className="run-hit"
+                            data-parts={run.parts.length}
+                            className={picked.includes(run.id) ? 'run-hit picked' : 'run-hit'}
                             style={{
                               left: box.x * scale,
                               top: box.y * scale,
@@ -1112,6 +1246,11 @@ export default function App() {
                             }}
                             onClick={(event) => {
                               event.stopPropagation()
+                              if (event.shiftKey) {
+                                setPicked((current) => (current.includes(run.id) ? current.filter((id) => id !== run.id) : [...current, run.id]))
+                                return
+                              }
+                              setPicked([])
                               beginEdit(run)
                             }}
                           />
@@ -1131,6 +1270,8 @@ export default function App() {
                         scale={scale}
                         metrics={metrics}
                         onChange={(patch, live) => updateEdit(edit.id, patch, live)}
+                        snapTargets={boxesExcept(edit.id)}
+                        onGuides={setGuides}
                         onSelect={() => {
                           setEditFocus(edit.id)
                           setFocusId(null)
@@ -1187,12 +1328,16 @@ export default function App() {
                 {doc.texts
                   .filter((item) => item.page === doc.pageIndex)
                   .map((item) => (
-                    <TextBox
+                      <TextBox
                       key={item.id}
                       item={item}
                       scale={scale}
                       metrics={metrics}
                       narrow={narrow}
+                      selected={focusId === item.id}
+                      snapTargets={boxesExcept(item.id)}
+                      onGuides={setGuides}
+                      onGeometry={(patch, live) => updateTextBox(item.id, patch, live)}
                       onChange={(value) => updateText(item.id, value, true)}
                       onKeyDown={(event) => onTextKey(event, item)}
                       onFocus={() => {
@@ -1329,6 +1474,8 @@ function EditBox({
   run,
   scale,
   metrics,
+  snapTargets,
+  onGuides,
   onChange,
   onSelect,
 }: {
@@ -1336,77 +1483,63 @@ function EditBox({
   run: TextRun
   scale: number
   metrics: { ascent: number; descent: number }
+  snapTargets: Rect[]
+  onGuides: (guides: Guide[]) => void
   onChange: (patch: Partial<TextEdit>, live: boolean) => void
   onSelect: () => void
 }) {
-  const drag = useRef<{ x: number; y: number; origX: number; origY: number } | null>(null)
-  const rtl = hasHebrew(edit.text) || run.dir === 'rtl'
-  const natural = edit.text ? measureTextWidth(edit.text, edit.fontSize) : 0
-  const width = Math.max(run.width, natural)
+  const align = resolvedAlign(edit.align ?? 'auto', edit.text)
+  const rtl = align === 'right' || (edit.align ?? 'auto') === 'auto' && (hasHebrew(edit.text) || run.dir === 'rtl')
   const line = edit.fontSize * (metrics.ascent + metrics.descent)
+  const height = edit.boxHeight || (run.ascent + run.descent) * edit.fontSize
+  const width = edit.boxWidth || run.width
   function onKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.nativeEvent.isComposing) return
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      return
-    }
     if (event.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
       event.preventDefault()
-      const step = event.shiftKey ? 4 : 1
+      const step = event.shiftKey ? 8 : 1
       const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
       const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0
       onChange({ x: edit.x + dx, baseline: edit.baseline + dy }, true)
     }
   }
-  function down(event: ReactPointerEvent<HTMLButtonElement>) {
-    event.stopPropagation()
-    event.preventDefault()
-    onSelect()
-    drag.current = { x: event.clientX, y: event.clientY, origX: edit.x, origY: edit.baseline }
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-  function move(event: ReactPointerEvent<HTMLButtonElement>) {
-    const state = drag.current
-    if (!state) return
-    onChange(
-      {
-        x: state.origX + (event.clientX - state.x) / scale,
-        baseline: state.origY + (event.clientY - state.y) / scale,
-      },
-      true,
-    )
-  }
-  function up() {
-    if (!drag.current) return
-    drag.current = null
-    onChange({}, false)
-  }
   return (
-    <div
-      data-overlay
-      data-testid="text-edit"
-      className="edit-box"
-      style={{ left: edit.x * scale, top: (edit.baseline - edit.fontSize * metrics.ascent) * scale }}
+    <BoxFrame
+      selected
+      testId="text-edit"
+      scale={scale}
+      left={edit.x}
+      top={edit.baseline - edit.fontSize * metrics.ascent}
+      width={width}
+      height={height}
+      snapTargets={snapTargets}
+      onGuides={onGuides}
+      onCommit={(rect, live) => {
+        if (!rect) {
+          onChange({}, false)
+          return
+        }
+        onChange(
+          {
+            x: rect.x,
+            baseline: rect.y + edit.fontSize * metrics.ascent,
+            boxWidth: rect.w,
+            boxHeight: rect.h,
+          },
+          live,
+        )
+      }}
     >
-      <button
-        type="button"
-        className="edit-move"
-        aria-label="Move text"
-        onPointerDown={down}
-        onPointerMove={move}
-        onPointerUp={up}
-      />
       <textarea
         data-edit-id={edit.id}
-        className="edit-text"
+        className="edit-text box-text"
         style={{
-          width: width * scale,
-          height: line * scale,
           fontSize: edit.fontSize * scale,
           lineHeight: `${line * scale}px`,
           fontWeight: edit.bold ? 700 : 400,
           color: edit.color,
-          textAlign: rtl ? 'right' : 'left',
+          textAlign: align,
+          background: edit.background || 'transparent',
         }}
         dir={rtl ? 'rtl' : 'ltr'}
         value={edit.text}
@@ -1418,7 +1551,7 @@ function EditBox({
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       />
-    </div>
+    </BoxFrame>
   )
 }
 
@@ -1458,6 +1591,10 @@ function TextBox({
   scale,
   metrics,
   narrow,
+  selected,
+  snapTargets,
+  onGuides,
+  onGeometry,
   onChange,
   onKeyDown,
   onFocus,
@@ -1468,6 +1605,10 @@ function TextBox({
   scale: number
   metrics: { ascent: number; descent: number }
   narrow: boolean
+  selected: boolean
+  snapTargets: Rect[]
+  onGuides: (guides: Guide[]) => void
+  onGeometry: (patch: Partial<TextItem>, live: boolean) => void
   onChange: (value: string) => void
   onKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => void
   onFocus: () => void
@@ -1475,26 +1616,49 @@ function TextBox({
   onRemove: () => void
 }) {
   const align = resolvedAlign(item.align, item.text)
-  const natural = item.text ? measureTextWidth(item.text, item.fontSize) + item.fontSize * 0.45 : 0
-  const width = Math.max(item.boxWidth, natural)
-  const left =
-    align === 'right' ? item.x + item.boxWidth - width : align === 'center' ? item.x + (item.boxWidth - width) / 2 : item.x
-  const lines = Math.max(1, item.text.split('\n').length)
   const line = item.fontSize * (metrics.ascent + metrics.descent)
+  const height = item.boxHeight && item.boxHeight > 0
+    ? item.boxHeight
+    : Math.max(line, layoutLines(item.text || ' ', item.boxWidth, 0, (value) => measureTextWidth(value, item.fontSize)).length * line)
   const rtl = align === 'right' || (item.align === 'auto' && hasHebrew(item.text))
   return (
-    <div data-overlay className="text-wrap" style={{ left: left * scale, top: (item.y - item.fontSize * metrics.ascent) * scale }}>
+    <BoxFrame
+      selected={selected}
+      testId="text-box"
+      scale={scale}
+      left={item.x}
+      top={item.y - item.fontSize * metrics.ascent}
+      width={item.boxWidth}
+      height={height}
+      snapTargets={snapTargets}
+      onGuides={onGuides}
+      onCommit={(rect, live) => {
+        if (!rect) {
+          onGeometry({}, false)
+          return
+        }
+        onGeometry(
+          {
+            x: rect.x,
+            y: rect.y + item.fontSize * metrics.ascent,
+            boxWidth: rect.w,
+            boxHeight: rect.h,
+          },
+          live,
+        )
+      }}
+    >
       <textarea
         data-text-id={item.id}
-        className="pdf-text"
+        className="pdf-text box-text"
         style={{
-          width: width * scale,
-          height: lines * line * scale,
           fontSize: item.fontSize * scale,
           lineHeight: `${line * scale}px`,
           fontWeight: item.bold ? 700 : 400,
           color: item.color,
           textAlign: align,
+          background: item.background || 'transparent',
+          textDecoration: item.underline ? 'underline' : 'none',
         }}
         dir={rtl ? 'rtl' : 'ltr'}
         value={item.text}
@@ -1507,10 +1671,12 @@ function TextBox({
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       />
-      <button type="button" className="mini-x" aria-label="Remove text" onMouseDown={(event) => event.preventDefault()} onClick={onRemove}>
-        ×
-      </button>
-    </div>
+      {selected ? (
+        <button type="button" className="mini-x" aria-label="Remove text" onMouseDown={(event) => event.preventDefault()} onClick={onRemove}>
+          ×
+        </button>
+      ) : null}
+    </BoxFrame>
   )
 }
 
@@ -1705,6 +1871,9 @@ function takeSnap(doc: DocState): Snap {
     signatures: doc.signatures.map((item) => ({ ...item })),
     covers: doc.covers.map((item) => ({ ...item })),
     edits: doc.edits.map((item) => ({ ...item })),
+    marks: doc.marks.map((item) => ({ ...item })),
+    images: doc.images.map((item) => ({ ...item })),
+    runs: doc.runs.map((item) => ({ ...item, parts: item.parts.map((part) => ({ ...part })) })),
     values: { ...doc.values },
   }
 }
