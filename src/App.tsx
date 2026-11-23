@@ -5,6 +5,7 @@ import { SignatureDialog } from './SignatureDialog.tsx'
 import { hasHebrew, resolvedAlign } from './lib/bidi.ts'
 import { ensureFonts, fontMetrics, getFontBytes, measureTextWidth } from './lib/fonts.ts'
 import { exportPdf, initialValues, openPdf, readPagesAndFields } from './lib/pdf.ts'
+import { editDiffers, extractRuns, runCoverBox } from './lib/runs.ts'
 import { bytesFromSession, clearSession, loadSession, saveSession, saveSessionNow } from './lib/storage.ts'
 import {
   SAMPLE_NAME,
@@ -14,15 +15,17 @@ import {
   type FormField,
   type SessionV1,
   type SignatureItem,
+  type TextEdit,
   type TextItem,
+  type TextRun,
 } from './lib/types.ts'
 
 const CLICK_BIAS = 0.3
 
-type Tool = 'text' | 'whiteout'
+type Tool = 'text' | 'whiteout' | 'edit'
 type PendingFile = { bytes: Uint8Array; name: string }
 type SigDraft = { dataUrl: string; aspect: number }
-type Snap = Pick<DocState, 'texts' | 'signatures' | 'covers' | 'values'>
+type Snap = Pick<DocState, 'texts' | 'signatures' | 'covers' | 'values' | 'edits'>
 
 export default function App() {
   const [boot, setBoot] = useState<'loading' | 'ready'>('loading')
@@ -35,6 +38,7 @@ export default function App() {
   const [status, setStatus] = useState<string | null>(null)
   const [tool, setTool] = useState<Tool>('text')
   const [focusId, setFocusId] = useState<string | null>(null)
+  const [editFocus, setEditFocus] = useState<string | null>(null)
   const [selectedSig, setSelectedSig] = useState<string | null>(null)
   const [selectedCover, setSelectedCover] = useState<string | null>(null)
   const [pendingSig, setPendingSig] = useState<SigDraft | null>(null)
@@ -239,6 +243,7 @@ export default function App() {
       return
     }
     const { pages, fields } = await readPagesAndFields(loaded)
+    const runs = await extractRuns(loaded)
     if (token !== generation.current) {
       await loaded.cleanup()
       return
@@ -256,6 +261,8 @@ export default function App() {
       texts: restored?.texts ?? [],
       signatures: restored?.signatures ?? [],
       covers: restored?.covers ?? [],
+      runs,
+      edits: (restored?.edits ?? []).filter((edit) => runs.some((run) => run.id === edit.runId)),
       values: { ...initialValues(fields), ...(restored?.values ?? {}) },
       pageIndex: clamp(restored?.pageIndex ?? 0, 0, Math.max(0, pages.length - 1)),
       zoom: restored?.zoom ?? guessZoom(pages[0]?.width ?? 595, rowHeight),
@@ -270,6 +277,7 @@ export default function App() {
     gesture.current = false
     setHist({ undo: 0, redo: 0 })
     setFocusId(null)
+    setEditFocus(null)
     setSelectedSig(null)
     setSelectedCover(null)
     setPendingSig(null)
@@ -285,7 +293,7 @@ export default function App() {
       setStatus('That file is not a PDF.')
       return
     }
-    if (docRef.current && (docRef.current.texts.length || docRef.current.signatures.length)) {
+    if (docRef.current && (docRef.current.texts.length || docRef.current.signatures.length || docRef.current.edits.length || docRef.current.covers.length)) {
       setPendingFile({ bytes, name })
       return
     }
@@ -324,6 +332,8 @@ export default function App() {
         texts: current.texts,
         signatures: current.signatures,
         covers: current.covers,
+        runs: current.runs,
+        edits: current.edits,
         values: current.values,
       })
       const copy = new Uint8Array(result.bytes)
@@ -351,6 +361,7 @@ export default function App() {
     setSavedAt(null)
     setRestored(false)
     setFocusId(null)
+    setEditFocus(null)
     setPendingSig(null)
     setStatus(null)
     setThumbs([])
@@ -412,8 +423,93 @@ export default function App() {
     remember()
     apply((d) => ({ ...d, texts: [...d.texts, item] }))
     setFocusId(id)
+    setEditFocus(null)
     setSelectedSig(null)
     setSelectedCover(null)
+  }
+
+  function beginEdit(run: TextRun) {
+    const current = docRef.current
+    if (!current) return
+    const existing = current.edits.find((edit) => edit.runId === run.id)
+    if (existing) {
+      setEditFocus(existing.id)
+      setFocusId(null)
+      setSelectedSig(null)
+      setSelectedCover(null)
+      return
+    }
+    const edit: TextEdit = {
+      id: uid(),
+      runId: run.id,
+      page: run.page,
+      x: run.x,
+      baseline: run.baseline,
+      text: run.text,
+      fontSize: run.fontSize,
+      color: run.color,
+      bold: run.bold,
+      deleted: false,
+    }
+    gesture.current = false
+    remember()
+    apply((d) => ({ ...d, edits: [...d.edits, edit] }))
+    setEditFocus(edit.id)
+    setFocusId(null)
+    setSelectedSig(null)
+    setSelectedCover(null)
+  }
+
+  function updateEdit(id: string, patch: Partial<TextEdit>, live: boolean) {
+    if (live) {
+      if (!gesture.current) {
+        remember()
+        gesture.current = true
+      }
+    } else {
+      gesture.current = false
+    }
+    if (Object.keys(patch).length === 0) return
+    apply((d) => ({
+      ...d,
+      edits: d.edits.map((edit) => (edit.id === id ? { ...edit, ...patch } : edit)),
+    }))
+  }
+
+  function deleteEdit(id: string) {
+    const current = docRef.current
+    const edit = current?.edits.find((item) => item.id === id)
+    if (!edit) return
+    gesture.current = false
+    remember()
+    if (edit.deleted) {
+      const run = current?.runs.find((item) => item.id === edit.runId)
+      apply((d) => ({
+        ...d,
+        edits: d.edits.map((item) =>
+          item.id === id
+            ? { ...item, deleted: false, text: run?.text ?? item.text, x: run?.x ?? item.x, baseline: run?.baseline ?? item.baseline }
+            : item,
+        ),
+      }))
+      return
+    }
+    apply((d) => ({
+      ...d,
+      edits: d.edits.map((item) => (item.id === id ? { ...item, deleted: true, text: '' } : item)),
+    }))
+  }
+
+  function dropUnchangedEdits(keepId: string | null) {
+    const current = docRef.current
+    if (!current) return
+    const stale = current.edits.filter((edit) => {
+      if (edit.id === keepId) return false
+      const run = current.runs.find((item) => item.id === edit.runId)
+      return run ? !editDiffers(edit, run) : false
+    })
+    if (!stale.length) return
+    apply((d) => ({ ...d, edits: d.edits.filter((edit) => !stale.some((item) => item.id === edit.id)) }))
   }
 
   function updateText(id: string, text: string, live: boolean) {
@@ -522,6 +618,11 @@ export default function App() {
     if (tool === 'whiteout') return
     if ((event.target as HTMLElement).closest('[data-overlay]')) return
     const pt = eventPoint(event)
+    if (tool === 'edit') {
+      dropUnchangedEdits(null)
+      setEditFocus(null)
+      return
+    }
     if (pendingSig) {
       const current = docRef.current
       if (!current) return
@@ -613,6 +714,11 @@ export default function App() {
   }, [focusId])
 
   useEffect(() => {
+    if (!editFocus) return
+    document.querySelector<HTMLTextAreaElement>(`[data-edit-id="${editFocus}"]`)?.focus()
+  }, [editFocus])
+
+  useEffect(() => {
     function onKey(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null
       const typing = Boolean(target?.closest('input, textarea, select'))
@@ -630,8 +736,12 @@ export default function App() {
         setPendingSig(null)
         setSignOpen(false)
         setFocusId(null)
+        dropUnchangedEdits(null)
+        setEditFocus(null)
       } else if ((event.key === 'Delete' || event.key === 'Backspace') && !typing) {
-        if (selectedSig) {
+        if (editFocus) {
+          deleteEdit(editFocus)
+        } else if (selectedSig) {
           gesture.current = false
           remember()
           apply((d) => ({ ...d, signatures: d.signatures.filter((sig) => sig.id !== selectedSig) }))
@@ -652,6 +762,11 @@ export default function App() {
   const narrow = frameWidth < 760
   const scale = page ? displayScale(page.width, frameWidth, doc.zoom) : 1
   const activeText = doc?.texts.find((item) => item.id === focusId) ?? null
+  const activeEdit = doc?.edits.find((item) => item.id === editFocus) ?? null
+  const shownSize = activeEdit?.fontSize ?? activeText?.fontSize ?? doc?.fontSize ?? 11
+  const shownColor = activeEdit?.color ?? activeText?.color ?? doc?.color ?? '#1a1714'
+  const sizeChoices = [8, 9, 10, 11, 12, 13, 14, 16, 18, 22]
+  const sizeOptions = sizeChoices.includes(shownSize) ? sizeChoices : [...sizeChoices, shownSize].sort((a, b) => a - b)
   const metrics = fontMetrics()
 
   return (
@@ -667,7 +782,7 @@ export default function App() {
       <header className="top">
         <div className="brand">
           <strong>Form desk</strong>
-          <span className="muted">Private PDF filler. Files stay on this device.</span>
+          <span className="muted">Private PDF editor. Files stay on this device.</span>
         </div>
         <div className="save-cluster">
           <span className="save" data-testid="save-state">
@@ -689,10 +804,10 @@ export default function App() {
 
       {boot === 'ready' && !doc ? (
         <section className="welcome" data-testid="welcome">
-          <h1>Fill the form. Keep the file.</h1>
+          <h1>Edit the form. Keep the file.</h1>
           <p>
-            Open a time sheet or any PDF, click a cell, and type in English or Hebrew. Add a signature, then download.
-            Nothing is uploaded.
+            Open a PDF and choose Edit text to rewrite what’s already printed, in English or Hebrew. You can still add
+            words, sign, and download. Nothing is uploaded.
           </p>
           <div className="welcome-actions">
             <button type="button" className="btn primary" onClick={() => fileRef.current?.click()}>
@@ -721,17 +836,19 @@ export default function App() {
             <label className="tool">
               Size
               <select
-                value={doc.fontSize}
+                value={shownSize}
                 onChange={(event) => {
                   const fontSize = Number(event.target.value)
+                  if (editFocus) remember()
                   apply((d) => ({
                     ...d,
                     fontSize,
                     texts: focusId ? d.texts.map((item) => (item.id === focusId ? { ...item, fontSize } : item)) : d.texts,
+                    edits: editFocus ? d.edits.map((item) => (item.id === editFocus ? { ...item, fontSize } : item)) : d.edits,
                   }))
                 }}
               >
-                {[8, 9, 10, 11, 12, 13, 14, 16, 18, 22].map((size) => (
+                {sizeOptions.map((size) => (
                   <option key={size} value={size}>
                     {size} pt
                   </option>
@@ -742,14 +859,16 @@ export default function App() {
               Color
               <input
                 type="color"
-                value={doc.color}
+                value={shownColor}
                 aria-label="Text color"
                 onChange={(event) => {
                   const color = event.target.value
+                  if (editFocus) remember()
                   apply((d) => ({
                     ...d,
                     color,
                     texts: focusId ? d.texts.map((item) => (item.id === focusId ? { ...item, color } : item)) : d.texts,
+                    edits: editFocus ? d.edits.map((item) => (item.id === editFocus ? { ...item, color } : item)) : d.edits,
                   }))
                 }}
               />
@@ -809,6 +928,53 @@ export default function App() {
             </label>
             <button
               type="button"
+              className={tool === 'edit' ? 'btn on' : 'btn'}
+              data-testid="edit-text"
+              aria-pressed={tool === 'edit'}
+              onClick={() => {
+                setTool((current) => {
+                  const next = current === 'edit' ? 'text' : 'edit'
+                  if (next === 'edit' && !doc.runs.some((run) => run.page === doc.pageIndex)) {
+                    setStatus('No selectable text on this page. Scanned or image-only PDFs cannot be edited this way. You can still add text on top.')
+                  } else if (next === 'edit') {
+                    setStatus(null)
+                  }
+                  return next
+                })
+              }}
+            >
+              Edit text
+            </button>
+            <button
+              type="button"
+              className={activeEdit?.bold || activeText?.bold ? 'btn on' : 'btn'}
+              data-testid="bold"
+              aria-pressed={Boolean(activeEdit?.bold || activeText?.bold)}
+              onClick={() => {
+                if (editFocus) {
+                  remember()
+                  apply((d) => ({ ...d, edits: d.edits.map((item) => (item.id === editFocus ? { ...item, bold: !item.bold } : item)) }))
+                } else if (focusId) {
+                  remember()
+                  apply((d) => ({ ...d, texts: d.texts.map((item) => (item.id === focusId ? { ...item, bold: !item.bold } : item)) }))
+                }
+              }}
+            >
+              Bold
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="delete-text"
+              disabled={!activeEdit}
+              onClick={() => {
+                if (activeEdit) deleteEdit(activeEdit.id)
+              }}
+            >
+              {activeEdit?.deleted ? 'Restore' : 'Delete text'}
+            </button>
+            <button
+              type="button"
               className={tool === 'whiteout' ? 'btn on' : 'btn'}
               aria-pressed={tool === 'whiteout'}
               onClick={() => setTool((current) => (current === 'whiteout' ? 'text' : 'whiteout'))}
@@ -851,7 +1017,9 @@ export default function App() {
           <p className="hint">
             {pendingSig
               ? 'Click the page where the signature should go. Esc cancels.'
-              : 'Click where the words should start. Tab moves across, Enter moves down. Whiteout covers a printed line.'}
+              : tool === 'edit'
+                ? 'Click existing text to rewrite it. Drag the teal grip to move it. Delete text removes the original words.'
+                : 'Click where the words should start. Tab moves across, Enter moves down. Whiteout covers a printed line.'}
             {doc.fields.length ? ` ${doc.fields.length} fillable field${doc.fields.length === 1 ? '' : 's'} on this file.` : ''}
           </p>
           {restored ? (
@@ -881,7 +1049,7 @@ export default function App() {
             </aside>
             <div className="frame" ref={frameRef} data-testid="frame">
               <div
-                className={tool === 'whiteout' || pendingSig ? 'sheet cross' : 'sheet'}
+                className={tool === 'whiteout' || pendingSig ? 'sheet cross' : tool === 'edit' ? 'sheet editing' : 'sheet'}
                 ref={sheetRef}
                 data-testid="page-stage"
                 style={{ width: page.width * scale, height: page.height * scale }}
@@ -891,6 +1059,86 @@ export default function App() {
                 onPointerUp={onCoverUp}
               >
                 <PdfCanvas pdf={pdf} pageIndex={doc.pageIndex} scale={scale} />
+                {doc.edits
+                  .filter((edit) => edit.page === doc.pageIndex)
+                  .map((edit) => {
+                    const run = doc.runs.find((item) => item.id === edit.runId)
+                    if (!run || (edit.id !== editFocus && !editDiffers(edit, run))) return null
+                    const box = runCoverBox(run)
+                    return (
+                      <button
+                        key={`${edit.id}-cover`}
+                        type="button"
+                        data-overlay
+                        data-testid="edit-cover"
+                        className={editFocus === edit.id ? 'edit-cover on' : 'edit-cover'}
+                        style={{
+                          left: box.x * scale,
+                          top: box.y * scale,
+                          width: box.width * scale,
+                          height: box.height * scale,
+                          background: run.background,
+                        }}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setEditFocus(edit.id)
+                          setFocusId(null)
+                        }}
+                      />
+                    )
+                  })}
+                {tool === 'edit'
+                  ? doc.runs
+                      .filter((run) => run.page === doc.pageIndex)
+                      .filter((run) => {
+                        const edit = doc.edits.find((item) => item.runId === run.id)
+                        return !edit || (edit.id !== editFocus && !editDiffers(edit, run))
+                      })
+                      .map((run) => {
+                        const box = runCoverBox(run)
+                        return (
+                          <button
+                            key={run.id}
+                            type="button"
+                            data-overlay
+                            data-testid="text-run"
+                            data-text={run.text}
+                            className="run-hit"
+                            style={{
+                              left: box.x * scale,
+                              top: box.y * scale,
+                              width: Math.max(box.width, 8) * scale,
+                              height: Math.max(box.height, 8) * scale,
+                            }}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              beginEdit(run)
+                            }}
+                          />
+                        )
+                      })
+                  : null}
+                {doc.edits
+                  .filter((edit) => edit.page === doc.pageIndex && !edit.deleted)
+                  .map((edit) => {
+                    const run = doc.runs.find((item) => item.id === edit.runId)
+                    if (!run || (edit.id !== editFocus && !editDiffers(edit, run))) return null
+                    return (
+                      <EditBox
+                        key={edit.id}
+                        edit={edit}
+                        run={run}
+                        scale={scale}
+                        metrics={metrics}
+                        onChange={(patch, live) => updateEdit(edit.id, patch, live)}
+                        onSelect={() => {
+                          setEditFocus(edit.id)
+                          setFocusId(null)
+                          setSelectedSig(null)
+                        }}
+                      />
+                    )
+                  })}
                 {doc.covers
                   .filter((cover) => cover.page === doc.pageIndex)
                   .map((cover) => (
@@ -949,6 +1197,8 @@ export default function App() {
                       onKeyDown={(event) => onTextKey(event, item)}
                       onFocus={() => {
                         setFocusId(item.id)
+                        dropUnchangedEdits(null)
+                        setEditFocus(null)
                         setSelectedSig(null)
                       }}
                       onBlur={() => {
@@ -968,6 +1218,8 @@ export default function App() {
                       onSelect={() => {
                         setSelectedSig(sig.id)
                         setFocusId(null)
+                        dropUnchangedEdits(null)
+                        setEditFocus(null)
                       }}
                       onChange={(patch, live) => {
                         if (live && !gesture.current) {
@@ -1072,6 +1324,104 @@ export default function App() {
   )
 }
 
+function EditBox({
+  edit,
+  run,
+  scale,
+  metrics,
+  onChange,
+  onSelect,
+}: {
+  edit: TextEdit
+  run: TextRun
+  scale: number
+  metrics: { ascent: number; descent: number }
+  onChange: (patch: Partial<TextEdit>, live: boolean) => void
+  onSelect: () => void
+}) {
+  const drag = useRef<{ x: number; y: number; origX: number; origY: number } | null>(null)
+  const rtl = hasHebrew(edit.text) || run.dir === 'rtl'
+  const natural = edit.text ? measureTextWidth(edit.text, edit.fontSize) : 0
+  const width = Math.max(run.width, natural)
+  const line = edit.fontSize * (metrics.ascent + metrics.descent)
+  function onKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.nativeEvent.isComposing) return
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      return
+    }
+    if (event.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+      event.preventDefault()
+      const step = event.shiftKey ? 4 : 1
+      const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
+      const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0
+      onChange({ x: edit.x + dx, baseline: edit.baseline + dy }, true)
+    }
+  }
+  function down(event: ReactPointerEvent<HTMLButtonElement>) {
+    event.stopPropagation()
+    event.preventDefault()
+    onSelect()
+    drag.current = { x: event.clientX, y: event.clientY, origX: edit.x, origY: edit.baseline }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+  function move(event: ReactPointerEvent<HTMLButtonElement>) {
+    const state = drag.current
+    if (!state) return
+    onChange(
+      {
+        x: state.origX + (event.clientX - state.x) / scale,
+        baseline: state.origY + (event.clientY - state.y) / scale,
+      },
+      true,
+    )
+  }
+  function up() {
+    if (!drag.current) return
+    drag.current = null
+    onChange({}, false)
+  }
+  return (
+    <div
+      data-overlay
+      data-testid="text-edit"
+      className="edit-box"
+      style={{ left: edit.x * scale, top: (edit.baseline - edit.fontSize * metrics.ascent) * scale }}
+    >
+      <button
+        type="button"
+        className="edit-move"
+        aria-label="Move text"
+        onPointerDown={down}
+        onPointerMove={move}
+        onPointerUp={up}
+      />
+      <textarea
+        data-edit-id={edit.id}
+        className="edit-text"
+        style={{
+          width: width * scale,
+          height: line * scale,
+          fontSize: edit.fontSize * scale,
+          lineHeight: `${line * scale}px`,
+          fontWeight: edit.bold ? 700 : 400,
+          color: edit.color,
+          textAlign: rtl ? 'right' : 'left',
+        }}
+        dir={rtl ? 'rtl' : 'ltr'}
+        value={edit.text}
+        spellCheck={false}
+        onChange={(event) => onChange({ text: event.target.value, deleted: false }, true)}
+        onKeyDown={onKeyDown}
+        onFocus={onSelect}
+        onBlur={() => onChange({}, false)}
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      />
+    </div>
+  )
+}
+
 function PdfCanvas({ pdf, pageIndex, scale }: { pdf: PDFDocumentProxy | null; pageIndex: number; scale: number }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
@@ -1142,6 +1492,7 @@ function TextBox({
           height: lines * line * scale,
           fontSize: item.fontSize * scale,
           lineHeight: `${line * scale}px`,
+          fontWeight: item.bold ? 700 : 400,
           color: item.color,
           textAlign: align,
         }}
@@ -1353,6 +1704,7 @@ function takeSnap(doc: DocState): Snap {
     texts: doc.texts.map((item) => ({ ...item })),
     signatures: doc.signatures.map((item) => ({ ...item })),
     covers: doc.covers.map((item) => ({ ...item })),
+    edits: doc.edits.map((item) => ({ ...item })),
     values: { ...doc.values },
   }
 }

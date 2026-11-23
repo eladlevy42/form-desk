@@ -56,6 +56,7 @@ export function sessionFromDoc(doc: DocState, savedAt = Date.now()): SessionV1 {
     texts: doc.texts,
     signatures: doc.signatures,
     covers: doc.covers,
+    edits: doc.edits,
     values: doc.values,
     pageIndex: doc.pageIndex,
     zoom: doc.zoom,

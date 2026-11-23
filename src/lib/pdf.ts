@@ -22,7 +22,8 @@ import {
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { hasHebrew, resolvedAlign, toVisual } from './bidi.ts'
 import { fontMetrics } from './fonts.ts'
-import type { CoverItem, FormField, PageInfo, SignatureItem, TextItem } from './types.ts'
+import { editDiffers, runCoverBox } from './runs.ts'
+import type { CoverItem, FormField, PageInfo, SignatureItem, TextEdit, TextItem, TextRun } from './types.ts'
 
 GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -202,6 +203,8 @@ export async function exportPdf(input: {
   texts: TextItem[]
   signatures: SignatureItem[]
   covers: CoverItem[]
+  runs: TextRun[]
+  edits: TextEdit[]
   values: Record<string, string | boolean>
 }): Promise<ExportResult> {
   const warnings: string[] = []
@@ -230,6 +233,17 @@ export async function exportPdf(input: {
     drawBox(page, viewport, cover, rgb(1, 1, 1))
   }
 
+  // Original text is stored as custom glyph IDs, so rewriting the content
+  // stream is not reliable. Cover the exact glyph box with the sampled
+  // background, then draw the replacement in the same place.
+  for (const edit of input.edits) {
+    const run = input.runs.find((item) => item.id === edit.runId)
+    const page = pdfDoc.getPage(edit.page)
+    const viewport = viewports[edit.page]
+    if (!run || !page || !viewport || !editDiffers(edit, run)) continue
+    drawBox(page, viewport, runCoverBox(run), parseColor(run.background))
+  }
+
   for (const item of input.texts) {
     const page = pdfDoc.getPage(item.page)
     const viewport = viewports[item.page]
@@ -237,6 +251,41 @@ export async function exportPdf(input: {
     const safe = keepSupportedChars(item.text)
     if (safe !== item.text) warnings.push('Some characters were skipped. The embedded font covers English and Hebrew.')
     drawTextItem(page, viewport, { ...item, text: safe }, font, lineFactor, warnings)
+  }
+
+  for (const edit of input.edits) {
+    const run = input.runs.find((item) => item.id === edit.runId)
+    const page = pdfDoc.getPage(edit.page)
+    const viewport = viewports[edit.page]
+    if (!run || !page || !viewport || edit.deleted || !edit.text.trim() || !editDiffers(edit, run)) continue
+    const safe = keepSupportedChars(edit.text)
+    if (safe !== edit.text) warnings.push('Some characters were skipped. The embedded font covers English and Hebrew.')
+    const hebrew = hasHebrew(safe) || run.dir === 'rtl'
+    let measured = run.width
+    try {
+      measured = font.widthOfTextAtSize(toVisual(safe), edit.fontSize)
+    } catch {
+      measured = run.width
+    }
+    drawTextItem(
+      page,
+      viewport,
+      {
+        id: edit.id,
+        page: edit.page,
+        x: edit.x,
+        y: edit.baseline,
+        text: safe,
+        fontSize: edit.fontSize,
+        color: edit.color,
+        align: hebrew ? 'right' : 'left',
+        boxWidth: Math.max(run.width, measured),
+        bold: edit.bold,
+      },
+      font,
+      lineFactor,
+      warnings,
+    )
   }
 
   for (const sig of input.signatures) {
@@ -308,15 +357,19 @@ function drawTextItem(
     if (align === 'right') vx = item.x + item.boxWidth - width
     const baseline = item.y + index * item.fontSize * lineFactor
     const [x, y] = viewport.convertToPdfPoint(vx, baseline) as number[]
+    const paint = {
+      y,
+      size: item.fontSize,
+      font,
+      color: parseColor(item.color),
+      rotate: Math.abs(angle) > 0.2 ? degrees(angle) : undefined,
+    }
     try {
-      page.drawText(visual, {
-        x,
-        y,
-        size: item.fontSize,
-        font,
-        color: parseColor(item.color),
-        rotate: Math.abs(angle) > 0.2 ? degrees(angle) : undefined,
-      })
+      page.drawText(visual, { ...paint, x })
+      if (item.bold) {
+        const shift = Math.max(0.25, item.fontSize * 0.03)
+        page.drawText(visual, { ...paint, x: x + shift })
+      }
     } catch {
       warnings.push('A line of text could not be written into the PDF.')
     }

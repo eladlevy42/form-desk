@@ -1,6 +1,6 @@
 # Form desk
 
-A private, browser-only PDF form filler. Open a time sheet or any PDF, click a cell, type in English or Hebrew, add a signature, and download. The file never leaves the device. There is no account, no upload, and no watermark.
+A private, browser-only PDF editor. Open a time sheet or any PDF, rewrite the text that is already there, add new words in English or Hebrew, sign, and download. The file never leaves the device. There is no account, no upload, and no watermark.
 
 ## Run it locally
 
@@ -25,7 +25,8 @@ Opening `dist/index.html` directly (`file://`) does not work in Chrome. Module s
 ## What you can do
 
 - Drop or open a PDF. The sample button loads a weekly time report with a table and two real form fields.
-- Click where the words should start. **Tab** moves across by the cell width. **Enter** moves down by the row height. **Shift+Enter** adds a line. **Alt+arrow** nudges the text.
+- **Edit text**, then click a line that is already printed. Change the words, size, bold, or color, drag the grip to move them, or delete them. The download covers the original glyphs and draws the replacement in the same place. Scanned pages have no text to select.
+- Click where new words should start. **Tab** moves across by the cell width. **Enter** moves down by the row height. **Shift+Enter** adds a line. **Alt+arrow** nudges the text.
 - Size, color, and alignment apply to the cell you are editing. Alignment **Auto** is right-to-left when the text is Hebrew.
 - Yellow boxes are real PDF form fields (text, checkboxes, radios, dropdowns).
 - **Whiteout** covers printed text so you can type over it.

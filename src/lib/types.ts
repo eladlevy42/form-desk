@@ -10,6 +10,38 @@ export type TextItem = {
   color: string
   align: Align
   boxWidth: number
+  bold?: boolean
+}
+
+/** A run of existing PDF text, in viewport space (origin top-left, scale 1). */
+export type TextRun = {
+  id: string
+  page: number
+  x: number
+  baseline: number
+  width: number
+  fontSize: number
+  color: string
+  background: string
+  text: string
+  dir: 'ltr' | 'rtl'
+  ascent: number
+  descent: number
+  bold: boolean
+}
+
+/** An in-place change to a TextRun. The original glyphs are covered on export. */
+export type TextEdit = {
+  id: string
+  runId: string
+  page: number
+  x: number
+  baseline: number
+  text: string
+  fontSize: number
+  color: string
+  bold: boolean
+  deleted: boolean
 }
 
 export type SignatureItem = {
@@ -63,6 +95,8 @@ export type DocState = {
   texts: TextItem[]
   signatures: SignatureItem[]
   covers: CoverItem[]
+  runs: TextRun[]
+  edits: TextEdit[]
   values: Record<string, string | boolean>
   pageIndex: number
   zoom: number
@@ -81,6 +115,7 @@ export type SessionV1 = {
   texts: TextItem[]
   signatures: SignatureItem[]
   covers: CoverItem[]
+  edits?: TextEdit[]
   values: Record<string, string | boolean>
   pageIndex: number
   zoom: number
