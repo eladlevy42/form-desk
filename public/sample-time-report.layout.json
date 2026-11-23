@@ -1,0 +1,56 @@
+{
+  "page": {
+    "width": 595.28,
+    "height": 841.89
+  },
+  "fontSize": 11,
+  "cellWidth": 58,
+  "rowHeight": 26,
+  "clicks": {
+    "name": {
+      "x": 86,
+      "y": 96,
+      "label": "Name"
+    },
+    "week": {
+      "x": 372,
+      "y": 96,
+      "label": "Week of"
+    },
+    "monDate": {
+      "x": 96,
+      "y": 195,
+      "label": "Mon Date"
+    },
+    "monIn": {
+      "x": 168,
+      "y": 195,
+      "label": "Mon In"
+    },
+    "monOut": {
+      "x": 226,
+      "y": 195,
+      "label": "Mon Out"
+    },
+    "monNotes": {
+      "x": 406,
+      "y": 195,
+      "label": "Mon Notes"
+    },
+    "tueIn": {
+      "x": 168,
+      "y": 221,
+      "label": "Tue In"
+    },
+    "signature": {
+      "x": 175,
+      "y": 420,
+      "label": "Signature"
+    },
+    "signDate": {
+      "x": 452,
+      "y": 422,
+      "label": "Sign date"
+    }
+  }
+}
