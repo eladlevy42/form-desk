@@ -14,6 +14,12 @@ export function SignatureDialog({ onCancel, onUse }: Props) {
   const drawing = useRef(false)
   const lastPt = useRef<{ x: number; y: number } | null>(null)
   const [uploadUrl, setUploadUrl] = useState<string | null>(null)
+  let savedSignature: string | null = null
+  try {
+    savedSignature = localStorage.getItem('form-desk-signature')
+  } catch {
+    savedSignature = null
+  }
 
   useEffect(() => {
     const canvas = drawRef.current
@@ -115,6 +121,20 @@ export function SignatureDialog({ onCancel, onUse }: Props) {
       >
         <h2 id="sign-title">Add a signature</h2>
         <p className="muted">Draw it, type it, or upload a picture. Then click the page to place it.</p>
+        {savedSignature ? (
+          <button
+            type="button"
+            className="btn"
+            data-testid="signature-saved"
+            onClick={() => {
+              const image = new Image()
+              image.onload = () => onUse(savedSignature, image.width / Math.max(1, image.height) || 3)
+              image.src = savedSignature
+            }}
+          >
+            Use saved signature
+          </button>
+        ) : null}
         <div className="tabs" role="tablist">
           {(['draw', 'type', 'upload'] as const).map((id) => (
             <button

@@ -115,7 +115,7 @@ function shouldJoin(prev: LooseGlyph, next: LooseGlyph): boolean {
   const gap = next.x - (prev.x + prev.width)
   const size = Math.min(prev.fontSize, next.fontSize)
   if (Math.abs(prev.fontSize - next.fontSize) > Math.max(1.5, size * 0.35)) return false
-  const kern = Math.max(1.1, size * 0.16)
+  const kern = Math.max(0.45, size * 0.06)
   if (gap <= kern) return true
   const loose = Math.min(3.1, Math.max(2.2, size * 0.3))
   if (gap > loose || gap < -size * 0.4) return false

@@ -72,7 +72,27 @@ button { cursor: pointer; }
   top: 0;
   z-index: 5;
   background: color-mix(in srgb, var(--desk) 92%, white);
+  overflow-x: auto;
 }
+
+.toolbar.more { position: static; padding-top: 0; }
+
+.btn { min-height: 36px; }
+
+.recent { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+.mark, .placed-image {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.mark.highlight { background: rgba(242, 193, 78, 0.45); }
+
+.mark.line { border-top: 2px solid var(--ink); height: 0; }
 
 .tool { display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; color: var(--muted); }
 

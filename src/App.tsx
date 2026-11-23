@@ -6,15 +6,20 @@ import { SignatureDialog } from './SignatureDialog.tsx'
 import { hasHebrew, resolvedAlign } from './lib/bidi.ts'
 import { ensureFonts, fontMetrics, getFontBytes, measureTextWidth } from './lib/fonts.ts'
 import { layoutLines, type Guide, type Rect } from './lib/layout.ts'
+import { appendPdf, deletePdfPage, insertBlankPage, movePdfPage, pageMapDelete, pageMapInsert, pageMapMove, remapPage, rotateBox90, rotatePdfPage } from './lib/pages.ts'
 import { exportPdf, initialValues, openPdf, readPagesAndFields } from './lib/pdf.ts'
 import { combineRuns, editDiffers, extractRuns, partCover, runCoverBox, splitRun, splitRunText } from './lib/runs.ts'
-import { bytesFromSession, clearSession, loadSession, saveSession, saveSessionNow } from './lib/storage.ts'
+import { bytesFromSession, clearSession, listDocs, loadNamedDoc, loadSession, saveNamedDoc, saveSession, saveSessionNow, type DocSummary } from './lib/storage.ts'
 import {
   SAMPLE_NAME,
   type Align,
   type CoverItem,
   type DocState,
+  type FontId,
   type FormField,
+  type ImageItem,
+  type MarkItem,
+  type MarkKind,
   type SessionV1,
   type SignatureItem,
   type TextEdit,
@@ -24,7 +29,7 @@ import {
 
 const CLICK_BIAS = 0.3
 
-type Tool = 'text' | 'whiteout' | 'edit' | 'highlight' | 'line' | 'check' | 'cross' | 'date'
+type Tool = 'text' | 'whiteout' | 'edit' | 'highlight' | 'line' | 'check' | 'cross' | 'date' | 'highlight' | 'line' | 'check' | 'cross' | 'date'
 type PendingFile = { bytes: Uint8Array; name: string }
 type SigDraft = { dataUrl: string; aspect: number }
 type Snap = Pick<DocState, 'texts' | 'signatures' | 'covers' | 'values' | 'edits' | 'marks' | 'images' | 'runs'>
@@ -43,6 +48,13 @@ export default function App() {
   const [editFocus, setEditFocus] = useState<string | null>(null)
   const [picked, setPicked] = useState<string[]>([])
   const [guides, setGuides] = useState<Guide[]>([])
+  const [recent, setRecent] = useState<DocSummary[]>([])
+  const [findQuery, setFindQuery] = useState('')
+  const [replaceWith, setReplaceWith] = useState('')
+  const [pendingImage, setPendingImage] = useState<SigDraft | null>(null)
+  const docId = useRef('')
+  const imageRef = useRef<HTMLInputElement>(null)
+  const mergeRef = useRef<HTMLInputElement>(null)
   const [selectedSig, setSelectedSig] = useState<string | null>(null)
   const [selectedCover, setSelectedCover] = useState<string | null>(null)
   const [pendingSig, setPendingSig] = useState<SigDraft | null>(null)
@@ -78,7 +90,8 @@ export default function App() {
       try {
         await ensureFonts()
         if (!cancel) setFontsReady(true)
-        const session = await loadSession()
+        const [session, docs] = await Promise.all([loadSession(), listDocs().catch(() => [])])
+        if (!cancel) setRecent(docs)
         if (cancel) return
         if (session) {
           await openBytes(bytesFromSession(session), session.fileName, session, true)
@@ -181,6 +194,9 @@ export default function App() {
     setSaving(true)
     try {
       const at = await saveSession(current)
+      if (!docId.current) docId.current = `doc-${Date.now()}`
+      await saveNamedDoc(docId.current, current, at)
+      setRecent(await listDocs())
       setSavedAt(at)
       setSaveError(null)
     } catch (err) {
@@ -291,6 +307,7 @@ export default function App() {
     setStatus(null)
     setPicked([])
     setRestored(fromSession)
+    docId.current = restored?.docId || `${fileName}-${Date.now()}`
     publish(next)
   }
 
@@ -723,9 +740,13 @@ export default function App() {
   }
 
   function onSheetClick(event: ReactMouseEvent<HTMLDivElement>) {
-    if (tool === 'whiteout') return
+    if (tool === 'whiteout' || tool === 'highlight' || tool === 'line') return
     if ((event.target as HTMLElement).closest('[data-overlay]')) return
     const pt = eventPoint(event)
+    if (tool === 'check' || tool === 'cross' || tool === 'date') {
+      placeMark(tool, pt.x, pt.y)
+      return
+    }
     if (tool === 'edit') {
       dropUnchangedEdits(null)
       setEditFocus(null)
@@ -751,13 +772,38 @@ export default function App() {
       setSelectedSig(sig.id)
       setPendingSig(null)
       setFocusId(null)
+      try {
+        localStorage.setItem('form-desk-signature', sig.dataUrl)
+      } catch {
+        /* ignore private-mode storage failures */
+      }
+      return
+    }
+    if (pendingImage) {
+      const current = docRef.current
+      if (!current) return
+      const width = 140
+      const height = width / Math.max(pendingImage.aspect, 0.2)
+      const image: ImageItem = {
+        id: uid(),
+        page: current.pageIndex,
+        x: pt.x,
+        y: pt.y,
+        width,
+        height,
+        dataUrl: pendingImage.dataUrl,
+      }
+      gesture.current = false
+      remember()
+      apply((d) => ({ ...d, images: [...d.images, image] }))
+      setPendingImage(null)
       return
     }
     createText(pt.x, pt.y)
   }
 
   function onCoverDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (tool !== 'whiteout') return
+    if (tool !== 'whiteout' && tool !== 'highlight' && tool !== 'line') return
     if ((event.target as HTMLElement).closest('[data-overlay]')) return
     const pt = eventPoint(event)
     coverOrigin.current = pt
@@ -767,7 +813,7 @@ export default function App() {
 
   function onCoverMove(event: ReactPointerEvent<HTMLDivElement>) {
     const origin = coverOrigin.current
-    if (!origin || tool !== 'whiteout') return
+    if (!origin || (tool !== 'whiteout' && tool !== 'highlight' && tool !== 'line')) return
     const pt = eventPoint(event)
     setDraftCover({
       x: Math.min(origin.x, pt.x),
@@ -790,20 +836,256 @@ export default function App() {
     }
     const current = docRef.current
     if (current && rect.w > 4 && rect.h > 4) {
-      const cover: CoverItem = {
-        id: uid(),
-        page: current.pageIndex,
-        x: rect.x,
-        y: rect.y,
-        width: rect.w,
-        height: rect.h,
-      }
       gesture.current = false
       remember()
-      apply((d) => ({ ...d, covers: [...d.covers, cover] }))
-      setSelectedCover(cover.id)
+      if (tool === 'highlight' || tool === 'line') {
+        const mark: MarkItem = {
+          id: uid(),
+          page: current.pageIndex,
+          kind: tool,
+          x: rect.x,
+          y: rect.y,
+          width: rect.w,
+          height: rect.h,
+          color: tool === 'highlight' ? '#f2c14e' : '#1a1714',
+        }
+        apply((d) => ({ ...d, marks: [...d.marks, mark] }))
+      } else {
+        const cover: CoverItem = {
+          id: uid(),
+          page: current.pageIndex,
+          x: rect.x,
+          y: rect.y,
+          width: rect.w,
+          height: rect.h,
+        }
+        apply((d) => ({ ...d, covers: [...d.covers, cover] }))
+        setSelectedCover(cover.id)
+      }
     }
     setDraftCover(null)
+  }
+
+  function nudgeSelection(dx: number, dy: number) {
+    const current = docRef.current
+    if (!current) return
+    gesture.current = false
+    remember()
+    if (editFocus) {
+      apply((d) => ({
+        ...d,
+        edits: d.edits.map((edit) => (edit.id === editFocus ? { ...edit, x: edit.x + dx, baseline: edit.baseline + dy } : edit)),
+      }))
+    } else if (focusId) {
+      apply((d) => ({
+        ...d,
+        texts: d.texts.map((item) => (item.id === focusId ? { ...item, x: item.x + dx, y: item.y + dy } : item)),
+      }))
+    }
+  }
+
+  function duplicateSelection() {
+    const current = docRef.current
+    if (!current) return
+    gesture.current = false
+    remember()
+    if (editFocus) {
+      const edit = current.edits.find((item) => item.id === editFocus)
+      if (!edit) return
+      const copy: TextItem = {
+        id: uid(),
+        page: edit.page,
+        x: edit.x + 12,
+        y: edit.baseline + 12,
+        text: edit.text,
+        fontSize: edit.fontSize,
+        color: edit.color,
+        align: edit.align,
+        boxWidth: edit.boxWidth,
+        boxHeight: edit.boxHeight,
+        bold: edit.bold,
+        font: edit.font,
+        underline: edit.underline,
+        background: edit.background,
+      }
+      apply((d) => ({ ...d, texts: [...d.texts, copy] }))
+      setFocusId(copy.id)
+      setEditFocus(null)
+      return
+    }
+    if (!focusId) return
+    const item = current.texts.find((entry) => entry.id === focusId)
+    if (!item) return
+    const copy: TextItem = { ...item, id: uid(), x: item.x + 12, y: item.y + 12 }
+    apply((d) => ({ ...d, texts: [...d.texts, copy] }))
+    setFocusId(copy.id)
+  }
+
+  function placeMark(kind: MarkKind, x: number, y: number) {
+    const current = docRef.current
+    if (!current) return
+    const mark: MarkItem = {
+      id: uid(),
+      page: current.pageIndex,
+      kind,
+      x,
+      y,
+      width: kind === 'date' ? 96 : 22,
+      height: kind === 'date' ? 16 : 22,
+      color: '#1a1714',
+      text: kind === 'date' ? new Date().toLocaleDateString() : undefined,
+    }
+    gesture.current = false
+    remember()
+    apply((d) => ({ ...d, marks: [...d.marks, mark] }))
+    setTool('text')
+  }
+
+  function replaceAll() {
+    const current = docRef.current
+    if (!current || !findQuery) return
+    gesture.current = false
+    remember()
+    apply((d) => {
+      let edits = [...d.edits]
+      for (const run of d.runs) {
+        if (!run.text.includes(findQuery)) continue
+        const text = run.text.split(findQuery).join(replaceWith)
+        const existing = edits.find((edit) => edit.runId === run.id)
+        const base: TextEdit = existing ?? {
+          id: uid(),
+          runId: run.id,
+          page: run.page,
+          x: run.x,
+          baseline: run.baseline,
+          text: run.text,
+          fontSize: run.fontSize,
+          color: run.color,
+          bold: false,
+          deleted: false,
+          boxWidth: run.width,
+          boxHeight: (run.ascent + run.descent) * run.fontSize,
+          align: 'auto',
+        }
+        const next = { ...base, text, deleted: text.length === 0 }
+        edits = existing ? edits.map((edit) => (edit.runId === run.id ? next : edit)) : [...edits, next]
+      }
+      return { ...d, edits }
+    })
+    setStatus(null)
+  }
+
+  async function commitPages(nextBytes: Uint8Array, map: (page: number) => number | null, nextIndex?: number) {
+    const current = docRef.current
+    if (!current) return
+    const keptTexts = [
+      ...current.texts,
+      ...current.edits
+        .filter((edit) => !edit.deleted && edit.text)
+        .map((edit) => ({
+          id: uid(),
+          page: edit.page,
+          x: edit.x,
+          y: edit.baseline,
+          text: edit.text,
+          fontSize: edit.fontSize,
+          color: edit.color,
+          align: edit.align,
+          boxWidth: edit.boxWidth,
+          boxHeight: edit.boxHeight,
+          bold: edit.bold,
+          font: edit.font,
+          underline: edit.underline,
+          background: edit.background,
+        })),
+    ]
+    remember()
+    const loaded = await openPdf(nextBytes)
+    const { pages, fields } = await readPagesAndFields(loaded)
+    const runs = await extractRuns(loaded)
+    if (pdfRef.current) await pdfRef.current.cleanup()
+    pdfRef.current = loaded
+    setPdf(loaded)
+    publish({
+      ...current,
+      pdfBytes: nextBytes,
+      pages,
+      fields,
+      runs,
+      texts: remapPage(keptTexts, map),
+      signatures: remapPage(current.signatures, map),
+      covers: remapPage(current.covers, map),
+      marks: remapPage(current.marks, map),
+      images: remapPage(current.images, map),
+      edits: [],
+      pageIndex: clamp(nextIndex ?? current.pageIndex, 0, Math.max(0, pages.length - 1)),
+    })
+  }
+
+  async function rotateCurrent() {
+    const current = docRef.current
+    if (!current) return
+    const index = current.pageIndex
+    const info = current.pages[index]
+    if (!info) return
+    const metricsNow = fontMetrics()
+    const spin = <T extends { page: number }>(items: T[], turn: (item: T) => T) => items.map((item) => (item.page === index ? turn(item) : item))
+    const texts = spin(current.texts, (item) => {
+      const height = item.boxHeight ?? item.fontSize * (metricsNow.ascent + metricsNow.descent)
+      const top = item.y - item.fontSize * metricsNow.ascent
+      const box = rotateBox90({ x: item.x, y: top, width: item.boxWidth, height }, info.width, info.height)
+      return { ...item, x: box.x, y: box.y + item.fontSize * metricsNow.ascent, boxWidth: box.width, boxHeight: box.height }
+    })
+    const boxOf = (item: { x: number; y: number; width: number; height: number }) => rotateBox90(item, info.width, info.height)
+    const nextBytes = await rotatePdfPage(current.pdfBytes, index)
+    remember()
+    const loaded = await openPdf(nextBytes)
+    const { pages, fields } = await readPagesAndFields(loaded)
+    const runs = await extractRuns(loaded)
+    if (pdfRef.current) await pdfRef.current.cleanup()
+    pdfRef.current = loaded
+    setPdf(loaded)
+    publish({
+      ...current,
+      pdfBytes: nextBytes,
+      pages,
+      fields,
+      runs,
+      texts,
+      signatures: spin(current.signatures, (item) => ({ ...item, ...boxOf(item) })),
+      covers: spin(current.covers, (item) => ({ ...item, ...boxOf(item) })),
+      marks: spin(current.marks, (item) => ({ ...item, ...boxOf(item) })),
+      images: spin(current.images, (item) => ({ ...item, ...boxOf(item) })),
+      edits: [],
+    })
+  }
+
+  async function printDoc() {
+    const current = docRef.current
+    const fontBytes = getFontBytes()
+    if (!current || !fontBytes) return
+    const result = await exportPdf({
+      pdfBytes: current.pdfBytes,
+      fontBytes,
+      texts: current.texts,
+      signatures: current.signatures,
+      covers: current.covers,
+      runs: current.runs,
+      edits: current.edits,
+      marks: current.marks,
+      images: current.images,
+      values: current.values,
+    })
+    const blob = new Blob([new Uint8Array(result.bytes)], { type: 'application/pdf' })
+    const url = URL.createObjectURL(blob)
+    const frame = document.createElement('iframe')
+    frame.style.position = 'fixed'
+    frame.style.width = '0'
+    frame.style.height = '0'
+    frame.style.border = '0'
+    frame.src = url
+    document.body.appendChild(frame)
+    frame.onload = () => frame.contentWindow?.print()
   }
 
   function placeFieldValue(name: string, value: string | boolean) {
@@ -839,7 +1121,16 @@ export default function App() {
         redo()
       } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault()
-        void download()
+        void persist()
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'd' && !typing) {
+        event.preventDefault()
+        duplicateSelection()
+      } else if (!typing && (editFocus || focusId) && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+        event.preventDefault()
+        const step = event.shiftKey ? 8 : 1
+        const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0
+        const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0
+        nudgeSelection(dx, dy)
       } else if (event.key === 'Escape') {
         setPendingSig(null)
         setSignOpen(false)
@@ -849,6 +1140,8 @@ export default function App() {
       } else if ((event.key === 'Delete' || event.key === 'Backspace') && !typing) {
         if (editFocus) {
           deleteEdit(editFocus)
+        } else if (focusId) {
+          removeText(focusId)
         } else if (selectedSig) {
           gesture.current = false
           remember()
@@ -926,6 +1219,24 @@ export default function App() {
             </button>
           </div>
           <p className="drop-hint">Or drop a PDF anywhere on this page.</p>
+          {recent.length ? (
+            <div className="recent" data-testid="recent-docs">
+              {recent.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    void loadNamedDoc(item.id).then((session) => {
+                      if (session) void openBytes(bytesFromSession(session), session.fileName, session, true)
+                    })
+                  }}
+                >
+                  {item.fileName}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <p className="heb-sample" dir="rtl">
             עברית ואנגלית
           </p>
@@ -992,6 +1303,7 @@ export default function App() {
                     ...d,
                     align,
                     texts: focusId ? d.texts.map((item) => (item.id === focusId ? { ...item, align } : item)) : d.texts,
+                    edits: editFocus ? d.edits.map((item) => (item.id === editFocus ? { ...item, align } : item)) : d.edits,
                   }))
                 }}
               >
@@ -1072,6 +1384,63 @@ export default function App() {
             </button>
             <button
               type="button"
+              className={activeEdit?.underline || activeText?.underline ? 'btn on' : 'btn'}
+              data-testid="underline"
+              onClick={() => {
+                if (editFocus) {
+                  remember()
+                  apply((d) => ({ ...d, edits: d.edits.map((item) => (item.id === editFocus ? { ...item, underline: !item.underline } : item)) }))
+                } else if (focusId) {
+                  remember()
+                  apply((d) => ({ ...d, texts: d.texts.map((item) => (item.id === focusId ? { ...item, underline: !item.underline } : item)) }))
+                }
+              }}
+            >
+              Underline
+            </button>
+            <label className="tool">
+              Font
+              <select
+                aria-label="Font"
+                data-testid="font-choice"
+                value={activeEdit?.font || activeText?.font || 'noto'}
+                onChange={(event) => {
+                  const font = event.target.value as FontId
+                  remember()
+                  apply((d) => ({
+                    ...d,
+                    texts: focusId ? d.texts.map((item) => (item.id === focusId ? { ...item, font } : item)) : d.texts,
+                    edits: editFocus ? d.edits.map((item) => (item.id === editFocus ? { ...item, font } : item)) : d.edits,
+                  }))
+                }}
+              >
+                <option value="noto">Sans</option>
+                <option value="script">Script</option>
+              </select>
+            </label>
+            <label className="tool">
+              Highlight
+              <select
+                aria-label="Box background"
+                data-testid="box-background"
+                value={activeEdit?.background || activeText?.background || ''}
+                onChange={(event) => {
+                  const background = event.target.value
+                  remember()
+                  apply((d) => ({
+                    ...d,
+                    texts: focusId ? d.texts.map((item) => (item.id === focusId ? { ...item, background } : item)) : d.texts,
+                    edits: editFocus ? d.edits.map((item) => (item.id === editFocus ? { ...item, background } : item)) : d.edits,
+                  }))
+                }}
+              >
+                <option value="">None</option>
+                <option value="#fff3b0">Yellow</option>
+                <option value="#d7f5df">Green</option>
+              </select>
+            </label>
+            <button
+              type="button"
               className="btn"
               data-testid="delete-text"
               disabled={!activeEdit}
@@ -1104,6 +1473,12 @@ export default function App() {
             >
               Whiteout
             </button>
+            <button type="button" className="btn" data-testid="save-now" onClick={() => void persist()}>
+              Save
+            </button>
+            <button type="button" className="btn" data-testid="print-doc" onClick={() => void printDoc()}>
+              Print
+            </button>
             <button type="button" className="btn" onClick={undo} disabled={hist.undo === 0}>
               Undo
             </button>
@@ -1135,6 +1510,90 @@ export default function App() {
             </button>
             <button type="button" className="btn primary" data-testid="download" onClick={() => void download()} disabled={busy || !fontsReady}>
               {busy ? 'Preparing…' : 'Download'}
+            </button>
+          </div>
+          <div className="toolbar more">
+            <label className="tool">
+              Stamp
+              <select
+                aria-label="Stamp"
+                data-testid="stamp-tool"
+                value={tool === 'highlight' || tool === 'line' || tool === 'check' || tool === 'cross' || tool === 'date' ? tool : ''}
+                onChange={(event) => setTool((event.target.value || 'text') as Tool)}
+              >
+                <option value="">None</option>
+                <option value="highlight">Highlight</option>
+                <option value="line">Line</option>
+                <option value="check">Check</option>
+                <option value="cross">X</option>
+                <option value="date">Date</option>
+              </select>
+            </label>
+            <button type="button" className="btn" data-testid="add-image" onClick={() => imageRef.current?.click()}>
+              Image
+            </button>
+            <button type="button" className="btn" data-testid="page-prev" onClick={() => apply((d) => ({ ...d, pageIndex: Math.max(0, d.pageIndex - 1) }))}>
+              Prev
+            </button>
+            <button type="button" className="btn" data-testid="page-next" onClick={() => apply((d) => ({ ...d, pageIndex: Math.min(d.pages.length - 1, d.pageIndex + 1) }))}>
+              Next
+            </button>
+            <button type="button" className="btn" data-testid="page-rotate" onClick={() => void rotateCurrent()}>
+              Rotate
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="page-blank"
+              onClick={() => {
+                const info = doc.pages[doc.pageIndex]
+                void insertBlankPage(doc.pdfBytes, doc.pageIndex + 1, info?.width ?? 612, info?.height ?? 792).then((bytes) =>
+                  commitPages(bytes, pageMapInsert(doc.pageIndex + 1), doc.pageIndex + 1),
+                )
+              }}
+            >
+              Blank page
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="page-delete"
+              disabled={doc.pages.length < 2}
+              onClick={() => void deletePdfPage(doc.pdfBytes, doc.pageIndex).then((bytes) => commitPages(bytes, pageMapDelete(doc.pageIndex), Math.max(0, doc.pageIndex - 1)))}
+            >
+              Delete page
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="page-up"
+              disabled={doc.pageIndex === 0}
+              onClick={() => void movePdfPage(doc.pdfBytes, doc.pageIndex, doc.pageIndex - 1).then((bytes) => commitPages(bytes, pageMapMove(doc.pageIndex, doc.pageIndex - 1), doc.pageIndex - 1))}
+            >
+              Page up
+            </button>
+            <button
+              type="button"
+              className="btn"
+              data-testid="page-down"
+              disabled={doc.pageIndex >= doc.pages.length - 1}
+              onClick={() => void movePdfPage(doc.pdfBytes, doc.pageIndex, doc.pageIndex + 1).then((bytes) => commitPages(bytes, pageMapMove(doc.pageIndex, doc.pageIndex + 1), doc.pageIndex + 1))}
+            >
+              Page down
+            </button>
+            <button type="button" className="btn" data-testid="page-merge" onClick={() => mergeRef.current?.click()}>
+              Merge PDF
+            </button>
+            <label className="tool">
+              Find
+              <input data-testid="find-text" value={findQuery} onChange={(event) => setFindQuery(event.target.value)} />
+            </label>
+            <label className="tool">
+              Replace
+              <input data-testid="replace-text" value={replaceWith} onChange={(event) => setReplaceWith(event.target.value)} />
+            </label>
+            <button type="button" className="btn" data-testid="replace-all" onClick={replaceAll}>
+              Replace all
             </button>
           </div>
           <p className="hint">
@@ -1182,6 +1641,31 @@ export default function App() {
                 onPointerUp={onCoverUp}
               >
                 <PdfCanvas pdf={pdf} pageIndex={doc.pageIndex} scale={scale} />
+                {doc.marks
+                  .filter((mark) => mark.page === doc.pageIndex)
+                  .map((mark) => (
+                    <div
+                      key={mark.id}
+                      data-overlay
+                      data-testid={`mark-${mark.kind}`}
+                      className={mark.kind === 'highlight' ? 'mark highlight' : mark.kind === 'line' ? 'mark line' : 'mark'}
+                      style={{ left: mark.x * scale, top: mark.y * scale, width: mark.width * scale, height: mark.height * scale }}
+                    >
+                      {mark.kind === 'check' ? '✓' : mark.kind === 'cross' ? '✕' : mark.kind === 'date' ? mark.text : ''}
+                    </div>
+                  ))}
+                {doc.images
+                  .filter((image) => image.page === doc.pageIndex)
+                  .map((image) => (
+                    <img
+                      key={image.id}
+                      data-overlay
+                      alt=""
+                      className="placed-image"
+                      src={image.dataUrl}
+                      style={{ left: image.x * scale, top: image.y * scale, width: image.width * scale, height: image.height * scale }}
+                    />
+                  ))}
                 {doc.edits
                   .filter((edit) => edit.page === doc.pageIndex)
                   .map((edit) => {
@@ -1412,6 +1896,39 @@ export default function App() {
           void onPick(file)
         }}
       />
+      <input
+        ref={imageRef}
+        className="sr-only"
+        type="file"
+        accept="image/png,image/jpeg"
+        data-testid="image-input"
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          event.target.value = ''
+          if (!file) return
+          const reader = new FileReader()
+          reader.onload = () => {
+            const url = String(reader.result || '')
+            const image = new Image()
+            image.onload = () => setPendingImage({ dataUrl: url, aspect: image.width / Math.max(1, image.height) })
+            image.src = url
+          }
+          reader.readAsDataURL(file)
+        }}
+      />
+      <input
+        ref={mergeRef}
+        className="sr-only"
+        type="file"
+        accept="application/pdf,.pdf"
+        data-testid="merge-input"
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          event.target.value = ''
+          if (!file || !doc) return
+          void file.arrayBuffer().then((buffer) => appendPdf(doc.pdfBytes, new Uint8Array(buffer)).then((bytes) => commitPages(bytes, (page) => page, doc.pages.length)))
+        }}
+      />
 
       {signOpen ? (
         <SignatureDialog
@@ -1539,6 +2056,8 @@ function EditBox({
           fontWeight: edit.bold ? 700 : 400,
           color: edit.color,
           textAlign: align,
+          textDecoration: edit.underline ? 'underline' : 'none',
+          fontFamily: edit.font === 'script' && !hasHebrew(edit.text) ? '"Great Vibes", cursive' : '"Noto Sans Hebrew", sans-serif',
           background: edit.background || 'transparent',
         }}
         dir={rtl ? 'rtl' : 'ltr'}
@@ -1659,6 +2178,7 @@ function TextBox({
           textAlign: align,
           background: item.background || 'transparent',
           textDecoration: item.underline ? 'underline' : 'none',
+          fontFamily: item.font === 'script' && !hasHebrew(item.text) ? '"Great Vibes", cursive' : '"Noto Sans Hebrew", sans-serif',
         }}
         dir={rtl ? 'rtl' : 'ltr'}
         value={item.text}
